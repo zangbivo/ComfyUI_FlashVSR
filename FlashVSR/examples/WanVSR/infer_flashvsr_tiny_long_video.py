@@ -10,7 +10,7 @@ import torch
 from einops import rearrange
 import folder_paths
 from ...diffsynth import ModelManager, FlashVSRTinyLongPipeline
-from .utils.utils import Buffer_LQ4x_Proj
+from .utils.utils import Buffer_LQ4x_Proj,Causal_LQ4x_Proj
 from .utils.TCDecoder import build_tcdecoder
 from .utils.utils import calculate_frame_adjustment_simple
 
@@ -240,27 +240,35 @@ def prepare_input_tensor(path: str, scale: float = 4, fps=30,dtype=torch.bfloat1
 
     raise ValueError(f"Unsupported input: {path}")
 
-def init_pipeline_long(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="cuda"):
+def init_pipeline_long(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",device="cuda",offload=False,version='1.0'):
     #print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     mm.load_models([ckpt_path,])
+    
     pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
-    pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
+    if offload:
+        device = "cpu"
+    if version=="1.0":
+        pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)   
+    else:
+        pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu",weights_only=False,), strict=True)
-    pipe.denoising_model().LQ_proj_in.to(device)
+    pipe.denoising_model().LQ_proj_in.to(device, dtype=torch.bfloat16)
 
-    multi_scale_channels = [512, 256, 128, 128]
-    pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
-    mis = pipe.TCDecoder.load_state_dict(torch.load(TCDecoder_path,weights_only=False,), strict=False)
-    print(mis)
+    # multi_scale_channels = [512, 256, 128, 128]
+    # pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
+    # mis = pipe.TCDecoder.load_state_dict(torch.load(TCDecoder_path,weights_only=False,), strict=False)
+    # print(mis)
 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
-    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit",])
+    pipe.offload=offload
     return pipe
 
-def run_inference_tiny_long(pipe,input,seed,scale,kv_ratio=3.0,local_range=11,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
-    pipe.to('cuda')
+def run_inference_tiny_long(pipe,input,seed,scale,kv_ratio=3.0,local_range=11,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,offload=False,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
+    if not offload:
+        pipe.to('cuda')
 
     pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
@@ -276,14 +284,16 @@ def run_inference_tiny_long(pipe,input,seed,scale,kv_ratio=3.0,local_range=11,st
             color_fix = color_fix,
             pad_first_frame=pad_first_frame,
             fix_method=fix_method,
+            offload=offload,
         )
     print("Done.")
-    pipe.to('cpu')
+    if not offload:
+        pipe.to('cpu')
     del LQ
     torch.cuda.empty_cache()   
     if pad_frames>0:
         print("Remove pad frames",pad_frames,frames.shape)
-        frames =  frames = frames[:, :-pad_frames, :, :]  #torch.Size([ 3, 85, 1024, 768]) -> torch.Size([ 3, 81, 1024, 768]) if 81 output -4 input + 8
+        frames = frames[:, :-pad_frames, :, :]  #torch.Size([ 3, 85, 1024, 768]) -> torch.Size([ 3, 81, 1024, 768]) if 81 output -4 input + 8
         
     frames = tensor2video(frames) 
     if save_vodeo_:
