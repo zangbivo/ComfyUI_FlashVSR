@@ -238,16 +238,18 @@ def prepare_input_tensor(path: str, scale: float = 4,fps=30, dtype=torch.bfloat1
 
     raise ValueError(f"Unsupported input: {path}")
 
-def init_pipeline_long_v11(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="cuda"):
+def init_pipeline_long_v11(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="cuda",offload=False):
     #print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     mm.load_models([ckpt_path,])
     pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device="cuda")
-    pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
+    if offload:
+        device = "cpu"
+    pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
     #LQ_proj_in_path = "./FlashVSR-v1.1/LQ_proj_in.ckpt"
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu",weights_only=False,), strict=True)
-    pipe.denoising_model().LQ_proj_in.to('cuda')
+    pipe.denoising_model().LQ_proj_in.to(device)
 
     multi_scale_channels = [512, 256, 128, 128]
     pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
@@ -257,6 +259,7 @@ def init_pipeline_long_v11(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.
     #pipe.to('cuda'); 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    pipe.offload=offload
     return pipe
 
 # def main():

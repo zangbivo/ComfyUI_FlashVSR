@@ -309,6 +309,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        offload=False,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -347,7 +348,8 @@ class FlashVSRTinyPipeline(BasePipeline):
             self.dit.LQ_proj_in.clear_cache()
 
         latents_total = []
-        self.TCDecoder.clean_mem()
+        if self.TCDecoder is not None:
+            self.TCDecoder.clean_mem()
         LQ_pre_idx = 0
         LQ_cur_idx = 0
 

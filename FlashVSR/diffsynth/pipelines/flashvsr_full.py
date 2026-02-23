@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
-from PIL import Image
+from ..models.wan_video_dit import BlockGPUManager
 from tqdm import tqdm
 # import pyfiglet
 
@@ -162,7 +162,7 @@ class FlashVSRFullPipeline(BasePipeline):
         self.width_division_factor = 16
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
-        self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
+        #self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
         self.new_decoder=False
         self.VAE=None
         self.version="1.0"
@@ -178,60 +178,63 @@ class FlashVSRFullPipeline(BasePipeline):
                           ⚡FlashVSR
 """)
 
-    def enable_vram_management(self, num_persistent_param_in_dit=None):
+    def enable_vram_management(self, num_persistent_param_in_dit=None,vae_only=False):
         # 仅管理 dit / vae
-        dtype = next(iter(self.dit.parameters())).dtype
         from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
-        enable_vram_management(
-            self.dit,
-            module_map={
-                torch.nn.Linear: AutoWrappedLinear,
-                torch.nn.Conv3d: AutoWrappedModule,
-                torch.nn.LayerNorm: AutoWrappedModule,
-                RMSNorm: AutoWrappedModule,
-            },
-            module_config=dict(
-                offload_dtype=dtype,
-                offload_device="cpu",
-                onload_dtype=dtype,
-                onload_device=self.device,
-                computation_dtype=self.torch_dtype,
-                computation_device=self.device,
-            ),
-            max_num_param=num_persistent_param_in_dit,
-            overflow_module_config=dict(
-                offload_dtype=dtype,
-                offload_device="cpu",
-                onload_dtype=dtype,
-                onload_device="cpu",
-                computation_dtype=self.torch_dtype,
-                computation_device=self.device,
-            ),
-        )
-        dtype = next(iter(self.vae.parameters())).dtype
-        enable_vram_management(
-            self.vae,
-            module_map={
-                torch.nn.Linear: AutoWrappedLinear,
-                torch.nn.Conv2d: AutoWrappedModule,
-                RMS_norm: AutoWrappedModule,
-                CausalConv3d: AutoWrappedModule,
-                Upsample: AutoWrappedModule,
-                torch.nn.SiLU: AutoWrappedModule,
-                torch.nn.Dropout: AutoWrappedModule,
-            },
-            module_config=dict(
-                offload_dtype=dtype,
-                offload_device="cpu",
-                onload_dtype=dtype,
-                onload_device=self.device,
-                computation_dtype=self.torch_dtype,
-                computation_device=self.device,
-            ),
-        )
+        if not vae_only:
+            dtype = next(iter(self.dit.parameters())).dtype
+            
+            enable_vram_management(
+                self.dit,
+                module_map={
+                    torch.nn.Linear: AutoWrappedLinear,
+                    torch.nn.Conv3d: AutoWrappedModule,
+                    torch.nn.LayerNorm: AutoWrappedModule,
+                    RMSNorm: AutoWrappedModule,
+                },
+                module_config=dict(
+                    offload_dtype=dtype,
+                    offload_device="cpu",
+                    onload_dtype=dtype,
+                    onload_device=self.device,
+                    computation_dtype=self.torch_dtype,
+                    computation_device=self.device,
+                ),
+                max_num_param=num_persistent_param_in_dit,
+                overflow_module_config=dict(
+                    offload_dtype=dtype,
+                    offload_device="cpu",
+                    onload_dtype=dtype,
+                    onload_device="cpu",
+                    computation_dtype=self.torch_dtype,
+                    computation_device=self.device,
+                ),
+            )
+        if self.vae is not None:
+            dtype = next(iter(self.vae.parameters())).dtype
+            enable_vram_management(
+                self.vae,
+                module_map={
+                    torch.nn.Linear: AutoWrappedLinear,
+                    torch.nn.Conv2d: AutoWrappedModule,
+                    RMS_norm: AutoWrappedModule,
+                    CausalConv3d: AutoWrappedModule,
+                    Upsample: AutoWrappedModule,
+                    torch.nn.SiLU: AutoWrappedModule,
+                    torch.nn.Dropout: AutoWrappedModule,
+                },
+                module_config=dict(
+                    offload_dtype=dtype,
+                    offload_device="cpu",
+                    onload_dtype=dtype,
+                    onload_device=self.device,
+                    computation_dtype=self.torch_dtype,
+                    computation_device=self.device,
+                ),
+            )
         self.enable_cpu_offload()
 
-    def fetch_models(self, model_manager: ModelManager):
+    def fetch_models(self, model_manager: ModelManager):  
         self.dit = model_manager.fetch_model("wan_video_dit")
         self.vae = model_manager.fetch_model("wan_video_vae")
 
@@ -243,7 +246,6 @@ class FlashVSRFullPipeline(BasePipeline):
         pipe.fetch_models(model_manager)
         # 可选：统一序列并行入口（此处默认关闭）
         pipe.use_unified_sequence_parallel = False
-        
         return pipe
 
     def denoising_model(self):
@@ -381,7 +383,17 @@ class FlashVSRFullPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        offload=False,
+
     ):
+        
+        
+        if not offload:
+            gpu_manager=None
+        else:
+            gpu_manager = BlockGPUManager(device="cuda")
+            gpu_manager.setup_for_inference(self.dit)
+
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
 
@@ -416,10 +428,11 @@ class FlashVSRFullPipeline(BasePipeline):
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
-
         latents_total = []
-        self.vae.clear_cache()
-
+        if self.vae is not None:
+            self.vae.clear_cache()
+        LQ_pre_idx = 0
+        LQ_cur_idx = 0
         with torch.no_grad():
             for cur_process_idx in tqdm(range(process_total_num)):
                 torch.cuda.synchronize()
@@ -430,6 +443,11 @@ class FlashVSRFullPipeline(BasePipeline):
                     pre_cache_v = [None] * len(self.dit.blocks)
                     LQ_latents = None
                     inner_loop_num = 7
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):
+                            #print("move LQ_proj_in to gpu for the first 7 frames")
+                            self.denoising_model().LQ_proj_in.to(gpu_manager.device)
+                      
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
                             LQ_video[:, :, max(0, inner_idx*4-3):(inner_idx+1)*4-3, :, :]
@@ -441,10 +459,18 @@ class FlashVSRFullPipeline(BasePipeline):
                         else:
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                    LQ_cur_idx = (inner_loop_num-1)*4-3
                     cur_latents = latents[:, :, :6, :, :]
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):     
+                            self.denoising_model().LQ_proj_in.to('cpu')
                 else:
                     LQ_latents = None
                     inner_loop_num = 2
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):
+                            #print("move LQ_proj_in to gpu for the rest frames")
+                            self.denoising_model().LQ_proj_in.to(gpu_manager.device)
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
                             LQ_video[:, :, cur_process_idx*8+17+inner_idx*4:cur_process_idx*8+21+inner_idx*4, :, :]
@@ -456,8 +482,11 @@ class FlashVSRFullPipeline(BasePipeline):
                         else:
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                    LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4            
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
-
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):     
+                            self.denoising_model().LQ_proj_in.to('cpu')
                 # 推理（无 motion_controller / vace）
                 #print(cur_latents.shape,"cur_latents") #torch.Size([1, 16, 6, 384, 640]) scale 4  cur_latents orch.Size([1, 16, 6, 96, 160]) cur_latents scale 1
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
@@ -478,13 +507,17 @@ class FlashVSRFullPipeline(BasePipeline):
                     t_mod=self.t_mod,
                     t=self.t,
                     local_range = local_range,
+                    gpu_manager=gpu_manager,
                 )
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
+                LQ_pre_idx = LQ_cur_idx
 
             latents = torch.cat(latents_total, dim=2)  #torch.Size([1, 16, 20, 48, 80])
+            if offload:
+                gpu_manager.unload_all_blocks_to_cpu()
             #self.dit.to("cpu")
             #torch.cuda.empty_cache
             # Decode
@@ -503,7 +536,7 @@ class FlashVSRFullPipeline(BasePipeline):
             # except:
             #     pass
                 
-        return latents #frames[0]
+        return latents,LQ_cur_idx #frames[0]
 
 
 # -----------------------------
@@ -578,6 +611,7 @@ def model_fn_wan_video(
     t_mod : torch.Tensor = None,
     t : torch.Tensor = None,
     local_range: int = 9,
+    gpu_manager=None,
     **kwargs,
 ):
     # patchify
@@ -622,6 +656,17 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         for block_id, block in enumerate(dit.blocks):
+            if gpu_manager is not None: # apple 1 block to save Vram
+                if block_id < len(dit.blocks):
+                    module = gpu_manager.managed_modules[block_id]
+                    if hasattr(module, 'to'):
+                        #print(f"move block {block_id} to gpu")
+                        module.to(gpu_manager.device)
+                if block_id > 0 and (block_id - 1) < len(dit.blocks):
+                    prev_module = gpu_manager.managed_modules[block_id - 1]
+                    if hasattr(prev_module, 'to'):
+                        prev_module.to('cpu')
+
             if LQ_latents is not None and block_id < len(LQ_latents):
                 x = x + LQ_latents[block_id]
             x, last_pre_cache_k, last_pre_cache_v = block(

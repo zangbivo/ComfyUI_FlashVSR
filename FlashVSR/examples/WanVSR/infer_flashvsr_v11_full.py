@@ -224,65 +224,69 @@ def prepare_input_tensor(path: str, scale: int = 4,fps=30, dtype=torch.bfloat16,
     else:
         raise ValueError(f"Unsupported input: {path}")
 
-def init_pipeline_v11(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_path: str = "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors", vae_path: str = "./FlashVSR/Wan2.1_VAE.pth",decode_vae="none",cur_dir="",device="cuda"):
+def init_pipeline_v11(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_path: str = "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",cur_dir="",device="cuda",offload=False):
     #print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
-    mm.load_models([ckpt_path,vae_path,])
-    new_decoder=True if decode_vae!="none"  else False
+    mm.load_models([ckpt_path,])
+    #mm.load_models([ckpt_path,vae_path,])
+    #new_decoder=True if decode_vae!="none"  else False
     pipe = FlashVSRFullPipeline.from_model_manager(mm, device="cuda")
-    if new_decoder:
-        pipe.new_decoder = True
-        if "light" in decode_vae.lower() or "tae" in decode_vae.lower():
-            if os.path.basename(decode_vae).split(".")[0]=="lightvaew2_1":
-                from ...vae import WanVAE
-                print("use lightvae decoder")
-                VAE = WanVAE(vae_path=decode_vae,dtype=torch.bfloat16,device=device,use_lightvae=True)
-            elif os.path.basename(decode_vae).split(".")[0]=="taew2_1":
-                from ...vae_tiny import WanVAE_tiny
-                print("use vae_tiny decoder")
-                VAE = WanVAE_tiny(vae_path=decode_vae,dtype=torch.bfloat16,device=device,need_scaled=False)
-            elif os.path.basename(decode_vae).split(".")[0]=="lighttaew2_1":
-                from ...vae_tiny import WanVAE_tiny
-                print("use vae_tiny light decoder")
-                VAE = WanVAE_tiny(vae_path=decode_vae,dtype=torch.bfloat16,device=device,need_scaled=True)
-            else:
-                raise ValueError(f"Unknown vae_name: {decode_vae},only support lightvae,tae,tae_tiny,lighttae_tiny")
-            pipe.VAE=VAE
-        else:    
-            print("use upscale2x decoder")
-            from diffusers import AutoencoderKLWan
-            config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/examples/config.json"))
-            VAE=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
-            vae_dict=load_file(decode_vae,device="cpu")
-            VAE.load_state_dict(vae_dict,strict=False)
-            pipe.VAE=VAE
-            del vae_dict
+    # if new_decoder:
+    #     pipe.new_decoder = True
+    #     if "light" in decode_vae.lower() or "tae" in decode_vae.lower():
+    #         if os.path.basename(decode_vae).split(".")[0]=="lightvaew2_1":
+    #             from ...vae import WanVAE
+    #             print("use lightvae decoder")
+    #             VAE = WanVAE(vae_path=decode_vae,dtype=torch.bfloat16,device=device,use_lightvae=True)
+    #         elif os.path.basename(decode_vae).split(".")[0]=="taew2_1":
+    #             from ...vae_tiny import WanVAE_tiny
+    #             print("use vae_tiny decoder")
+    #             VAE = WanVAE_tiny(vae_path=decode_vae,dtype=torch.bfloat16,device=device,need_scaled=False)
+    #         elif os.path.basename(decode_vae).split(".")[0]=="lighttaew2_1":
+    #             from ...vae_tiny import WanVAE_tiny
+    #             print("use vae_tiny light decoder")
+    #             VAE = WanVAE_tiny(vae_path=decode_vae,dtype=torch.bfloat16,device=device,need_scaled=True)
+    #         else:
+    #             raise ValueError(f"Unknown vae_name: {decode_vae},only support lightvae,tae,tae_tiny,lighttae_tiny")
+    #         pipe.VAE=VAE
+    #     else:    
+    #         print("use upscale2x decoder")
+    #         from diffusers import AutoencoderKLWan
+    #         config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/examples/config.json"))
+    #         VAE=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
+    #         vae_dict=load_file(decode_vae,device="cpu")
+    #         VAE.load_state_dict(vae_dict,strict=False)
+    #         pipe.VAE=VAE
+    #         del vae_dict
     
-    pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
-    #LQ_proj_in_path = "./FlashVSR-v1.1/LQ_proj_in.ckpt"
+    if offload:
+        device = "cpu"
+    pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu",weights_only=False), strict=True)
 
-    pipe.denoising_model().LQ_proj_in.to('cuda')
-    if pipe.vae is  None:  # safetensors cause error or unknown safetensors or pth
-        from diffusers import AutoencoderKLWan
-        config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/config.json"))
-        vae=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
-        vae_dict=torch.load(vae_path, map_location="cpu",weights_only=False) if not vae_path.endswith(".safetensors") else load_file(vae_path,device="cpu")
-        vae.load_state_dict(vae_dict,strict=False)
-        del vae_dict
-        pipe.vae=vae
-        pipe.vae.encoder = None
-    else:
-        pipe.vae.model.encoder = None
-        pipe.vae.model.conv1 = None
+    pipe.denoising_model().LQ_proj_in.to(device)
+    # if pipe.vae is  None:  # safetensors cause error or unknown safetensors or pth
+    #     from diffusers import AutoencoderKLWan
+    #     config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/config.json"))
+    #     vae=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
+    #     vae_dict=torch.load(vae_path, map_location="cpu",weights_only=False) if not vae_path.endswith(".safetensors") else load_file(vae_path,device="cpu")
+    #     vae.load_state_dict(vae_dict,strict=False)
+    #     del vae_dict
+    #     pipe.vae=vae
+    #     pipe.vae.encoder = None
+    # else:
+    #     pipe.vae.model.encoder = None
+    #     pipe.vae.model.conv1 = None
     #pipe.to('cuda'); 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
-    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit",])
+    pipe.offload=offload
     return pipe
 
-def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,tiled=True,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda",save_vodeo_=False,):
-    pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
+def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,tiled=True,color_fix=True,fix_method="wavelet",split_num=81,offload=False,dtype=torch.bfloat16,device="cuda",save_vodeo_=False,):
+    if not offload:
+        pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
     #pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
     pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
@@ -299,7 +303,8 @@ def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_sc
         local_range=local_range, # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
         color_fix = color_fix,
     )
-    pipe.dit.to('cpu')
+    if not offload:
+        pipe.dit.to('cpu')
     torch.cuda.empty_cache()
     #torch.Size([1, 16, 20, 48, 80])
     tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}

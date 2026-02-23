@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
-from PIL import Image
+from ..models.wan_video_dit import BlockGPUManager
 from tqdm import tqdm
 # import pyfiglet
 
@@ -157,6 +157,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.dit: WanModel = None
         self.vae: WanVideoVAE = None
+        self.TCDecoder = None
         self.model_names = ['dit', 'vae']
         self.height_division_factor = 16
         self.width_division_factor = 16
@@ -175,10 +176,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                          ⚡FlashVSR
 """)
 
-    def enable_vram_management(self, num_persistent_param_in_dit=None):
+    def enable_vram_management(self, num_persistent_param_in_dit=None,):
         # 仅管理 dit / vae
-        dtype = next(iter(self.dit.parameters())).dtype
         from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
+        dtype = next(iter(self.dit.parameters())).dtype
         enable_vram_management(
             self.dit,
             module_map={
@@ -310,7 +311,14 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         color_fix = True,
         pad_first_frame=False,
         fix_method="wavelet",
+        offload=False,
     ):
+        if not offload:
+            gpu_manager=None
+        else:
+            gpu_manager = BlockGPUManager(device="cuda")
+            gpu_manager.setup_for_inference(self.dit)
+
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
 
@@ -346,11 +354,13 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
-
-        self.TCDecoder.clean_mem()
+        if self.TCDecoder is not None:
+            self.TCDecoder.clean_mem()
         LQ_pre_idx = 0
         LQ_cur_idx = 0
         frames_total = []
+        lQ_cur_list = []
+
 
         with torch.no_grad():
             for cur_process_idx in tqdm(range(process_total_num)):
@@ -359,6 +369,9 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     pre_cache_v = [None] * len(self.dit.blocks)
                     LQ_latents = None
                     inner_loop_num = 7
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):
+                            self.denoising_model().LQ_proj_in.to(gpu_manager.device)
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
                             LQ_video[:, :, max(0, inner_idx*4-3):(inner_idx+1)*4-3, :, :].to(self.device)
@@ -372,9 +385,15 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     LQ_cur_idx = (inner_loop_num-1)*4-3
                     cur_latents = latents[:, :, :6, :, :]
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):     
+                            self.denoising_model().LQ_proj_in.to('cpu')
                 else:
                     LQ_latents = None
                     inner_loop_num = 2
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):
+                            self.denoising_model().LQ_proj_in.to(gpu_manager.device)
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
                             LQ_video[:, :, cur_process_idx*8+17+inner_idx*4:cur_process_idx*8+21+inner_idx*4, :, :].to(self.device)
@@ -388,6 +407,9 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
+                    if gpu_manager is not None: # apple 1 block to save Vram
+                        if hasattr(self.denoising_model().LQ_proj_in, 'to'):     
+                            self.denoising_model().LQ_proj_in.to('cpu')
 
                 # 推理（无 motion_controller / vace）
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
@@ -408,38 +430,41 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     t_mod=self.t_mod,
                     t=self.t,
                     local_range = local_range,
+                    gpu_manager=gpu_manager,
                 )
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
                 # Decode
-                cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
-                cur_frames = self.TCDecoder.decode_video(cur_latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)).transpose(1, 2).mul_(2).sub_(1)
+                lQ_cur_list.append((LQ_cur_idx,LQ_pre_idx,))
+                #cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
+                #cur_frames = self.TCDecoder.decode_video(cur_latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)).transpose(1, 2).mul_(2).sub_(1)
 
-                # 颜色校正（wavelet）
-                try:
-                    if color_fix:
-                        if pad_first_frame: # 加帧
-                            cur_frames = dup_first_frame_1cthw_simple(cur_frames)
-                            cur_LQ_frame=dup_first_frame_1cthw_simple(cur_LQ_frame)
-                        cur_frames = self.ColorCorrector(
-                            cur_frames.to(device=self.device),
-                            cur_LQ_frame,
-                            clip_range=(-1, 1),
-                            chunk_size=None,
-                            method=fix_method,
-                        )
-                        if pad_first_frame: #减帧
-                            cur_frames = cur_frames[:, :, 1:, :, :] # remove first frame
-                except:
-                    pass
+                # # 颜色校正（wavelet）
+                # try:
+                #     if color_fix:
+                #         if pad_first_frame: # 加帧
+                #             cur_frames = dup_first_frame_1cthw_simple(cur_frames)
+                #             cur_LQ_frame=dup_first_frame_1cthw_simple(cur_LQ_frame)
+                #         cur_frames = self.ColorCorrector(
+                #             cur_frames.to(device=self.device),
+                #             cur_LQ_frame,
+                #             clip_range=(-1, 1),
+                #             chunk_size=None,
+                #             method=fix_method,
+                #         )
+                #         if pad_first_frame: #减帧
+                #             cur_frames = cur_frames[:, :, 1:, :, :] # remove first frame
+                # except:
+                #     pass
 
-                frames_total.append(cur_frames.to('cpu'))
+                #frames_total.append(cur_frames.to('cpu'))
+                frames_total.append(cur_latents)
                 LQ_pre_idx = LQ_cur_idx
 
-            frames = torch.cat(frames_total, dim=2)
+            #frames = torch.cat(frames_total, dim=2)
 
-        return frames[0]
+        return frames_total,lQ_cur_list
 
 def dup_first_frame_1cthw_simple(video_tensor):
     return torch.cat([video_tensor[:, :, :1], video_tensor], dim=2)
@@ -516,6 +541,7 @@ def model_fn_wan_video(
     t_mod : torch.Tensor = None,
     t : torch.Tensor = None,
     local_range: int = 9,
+    gpu_manager=None,
     **kwargs,
 ):
     # patchify
@@ -560,6 +586,16 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         for block_id, block in enumerate(dit.blocks):
+            if gpu_manager is not None: # apple 1 block to save Vram
+                if block_id < len(dit.blocks):
+                    module = gpu_manager.managed_modules[block_id]
+                    if hasattr(module, 'to'):
+                        #print(f"move block {block_id} to gpu")
+                        module.to(gpu_manager.device)
+                if block_id > 0 and (block_id - 1) < len(dit.blocks):
+                    prev_module = gpu_manager.managed_modules[block_id - 1]
+                    if hasattr(prev_module, 'to'):
+                        prev_module.to('cpu')
             if LQ_latents is not None and block_id < len(LQ_latents):
                 x = x + LQ_latents[block_id]
             x, last_pre_cache_k, last_pre_cache_v = block(

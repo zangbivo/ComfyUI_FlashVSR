@@ -38,6 +38,62 @@ except:
     print("**************导入block_sparse_attn失败,调用临时函数;Using wrapper block_sparse_attn ,need to install block_sparse_attn to get better performance*************")
     from ...examples.WanVSR.utils.utils import block_sparse_attn_func
 
+class BlockGPUManager:
+    def __init__(self, device="cuda",):
+        self.device = device
+        self.managed_modules = []
+        self.embedder_modules = []
+    
+    def setup_for_inference(self, transformer_model,):
+        self._collect_managed_modules(transformer_model)
+        self._initialize_embedder_modules()
+        return self
+
+    def _collect_managed_modules(self, transformer_model):
+        self.managed_modules = []
+        self.embedder_modules = []
+
+        for i, block in enumerate(transformer_model.blocks):
+            self.managed_modules.append(block)
+
+        if hasattr(transformer_model, 'time_embedding'):
+            self.embedder_modules.append(transformer_model.time_embedding)
+        
+        if hasattr(transformer_model, 'time_projection'):
+            self.embedder_modules.append(transformer_model.time_projection)
+        
+        if hasattr(transformer_model, 'text_embedding'):
+            self.embedder_modules.append(transformer_model.text_embedding)
+        
+        if hasattr(transformer_model, 'patch_embedding'):
+            self.embedder_modules.append(transformer_model.patch_embedding)
+        
+        if hasattr(transformer_model, 'head'):
+            self.embedder_modules.append(transformer_model.head)
+        
+        # if hasattr(transformer_model, 'LQ_proj_in'):
+        #     self.embedder_modules.append(transformer_model.LQ_proj_in)
+
+  
+    def _initialize_embedder_modules(self):
+        for module in self.embedder_modules:
+            if hasattr(module, 'to'):
+                module.to(self.device, non_blocking=True)
+        return self
+
+
+    def unload_all_blocks_to_cpu(self):
+        for module in self.managed_modules:
+            if hasattr(module, 'to'):
+                module.to('cpu')
+
+        for module in self.embedder_modules:
+            if hasattr(module, 'to'):
+                module.to('cpu')
+        
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # ----------------------------
 # Local / window masks
@@ -609,6 +665,7 @@ class WanModel(torch.nn.Module):
                 local_num: Optional[int] = None,
                 is_full_block: bool = False,
                 causal_idx: Optional[int] = None,
+                gpu_manager=None,
                 **kwargs,
                 ):
         # time / text embeds
@@ -664,6 +721,16 @@ class WanModel(torch.nn.Module):
         for block_id, block in enumerate(self.blocks):
             if LQ_latents is not None and block_id < len(LQ_latents):
                 x += LQ_latents[block_id]
+
+            if gpu_manager is not None: # apple 1 block to save Vram
+                if block_id < len(self.blocks):
+                    module = gpu_manager.managed_modules[block_id]
+                    if hasattr(module, 'to'):
+                        module.to(gpu_manager.device)
+                if block_id > 0 and (block_id - 1) < len(self.blocks):
+                    prev_module = gpu_manager.managed_modules[block_id - 1]
+                    if hasattr(prev_module, 'to'):
+                        prev_module.to('cpu')
 
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:

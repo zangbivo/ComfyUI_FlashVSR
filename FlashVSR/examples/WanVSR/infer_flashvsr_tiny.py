@@ -239,11 +239,13 @@ def prepare_input_tensor(path: str, scale: float = 4,fps=30, dtype=torch.bfloat1
         raise ValueError(f"Unsupported input: {path}")
    
 
-def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="cuda"):
+def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt",ckpt_path="./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",TCDecoder_path="./FlashVSR/TCDecoder.ckpt",device="cuda",offload=False):
 
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     mm.load_models([ckpt_path,])
     pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
+    if offload:
+        device = "cpu"
     pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
     
     if os.path.exists(LQ_proj_in_path):
@@ -257,10 +259,13 @@ def init_pipeline_tiny(prompt_path,LQ_proj_in_path = "./FlashVSR/LQ_proj_in.ckpt
 
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    pipe.offload=offload
     return pipe
 
-def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
-    pipe.to('cuda')
+def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,color_fix=True,fix_method="wavelet",split_num=81,offload=False,dtype=torch.bfloat16,device="cuda", save_vodeo_=False,):
+    if not offload:
+        pipe.to('cuda')
+    
 
     pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
@@ -274,8 +279,10 @@ def run_inference_tiny(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,c
         kv_ratio=kv_ratio,
         local_range=local_range,  # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
         color_fix = color_fix,
+        offload=offload,
     )
-    pipe.dit.to('cpu')  
+    if not offload:
+        pipe.dit.to('cpu')  
     torch.cuda.empty_cache()   
     #print(LQ.shape,frames.shape,LQ_cur_idx)#torch.Size([1, 3, 81, 384, 640]) torch.Size([1, 16, 20, 48, 80]) 77
     with torch.no_grad():

@@ -10,7 +10,7 @@ import torch
 from einops import rearrange
 import folder_paths
 from ...diffsynth import ModelManager, FlashVSRFullPipeline
-from .utils.utils import Buffer_LQ4x_Proj
+from .utils.utils import Buffer_LQ4x_Proj,Causal_LQ4x_Proj
 from comfy.utils import common_upscale
 from safetensors.torch import load_file
 from .utils.utils import calculate_frame_adjustment_simple
@@ -253,151 +253,117 @@ def prepare_input_tensor(path, scale: int = 4,fps=30,dtype=torch.bfloat16, devic
     else:
         raise ValueError(f"Unsupported input: {path}")
 
-def init_pipeline(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_path: str = "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors", vae_path: str = "./FlashVSR/Wan2.1_VAE.pth",decode_vae="none",cur_dir="",device="cuda"):
-    #print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
+def init_pipeline(prompt_path,LQ_proj_in_path="./FlashVSR/LQ_proj_in.ckpt",ckpt_path: str = "./FlashVSR/diffusion_pytorch_model_streaming_dmd.safetensors",cur_dir="",device="cuda",offload=False,version='1.0'):
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
-    new_decoder=True if decode_vae!="none"  else False
-    mm.load_models([ckpt_path,vae_path,])
+    mm.load_models([ckpt_path])
     pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
-    
-    if new_decoder:
-        pipe.new_decoder = True
-        if "light" in decode_vae.lower() or "tae" in decode_vae.lower():
-            if os.path.basename(decode_vae).split(".")[0]=="lightvaew2_1":
-                from ...vae import WanVAE
-                print("use lightvae decoder")
-                VAE = WanVAE(vae_path=decode_vae,dtype=torch.bfloat16,device=device,use_lightvae=True)
-            elif os.path.basename(decode_vae).split(".")[0]=="taew2_1":
-                from ...vae_tiny import WanVAE_tiny
-                print("use vae_tiny decoder")
-                VAE = WanVAE_tiny(vae_path=decode_vae,dtype=torch.bfloat16,device=device,need_scaled=False)
-            elif os.path.basename(decode_vae).split(".")[0]=="lighttaew2_1":
-                from ...vae_tiny import WanVAE_tiny
-                print("use vae_tiny light decoder")
-                VAE = WanVAE_tiny(vae_path=decode_vae,dtype=torch.bfloat16,device=device,need_scaled=True)
-            else:
-                raise ValueError(f"Unknown vae_name: {decode_vae},only support lightvae,tae,tae_tiny,lighttae_tiny")
-            pipe.VAE=VAE
-        else:    
-            print("use upscale2x decoder")
-            from diffusers import AutoencoderKLWan
-            config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/examples/config.json"))
-            VAE=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
-            vae_dict=load_file(decode_vae,device="cpu")
-            VAE.load_state_dict(vae_dict,strict=False)
-            pipe.VAE=VAE
-            del vae_dict
-    
-        
-    pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
+    if offload:
+        device = "cpu"    
+    if version=="1.0":
+        pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
+    else:
+        pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=torch.bfloat16)
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu",weights_only=False), strict=True)
-    pipe.denoising_model().LQ_proj_in.to(device)
-    if pipe.vae is  None:  # safetensors cause error or unknown safetensors or pth
-        from diffusers import AutoencoderKLWan
-        config=AutoencoderKLWan.load_config(os.path.join(cur_dir,"FlashVSR/config.json"))
-        vae=AutoencoderKLWan.from_config(config).to(device,dtype=torch.bfloat16)
-        vae_dict=torch.load(vae_path, map_location="cpu",weights_only=False) if not vae_path.endswith(".safetensors") else load_file(vae_path,device="cpu")
-        vae.load_state_dict(vae_dict,strict=False)
-        del vae_dict
-        pipe.vae=vae
-        pipe.vae.encoder = None
-    else:
-        pipe.vae.model.encoder = None
-        pipe.vae.model.conv1 = None
+    pipe.denoising_model().LQ_proj_in.to(device)  
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
-    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
+    pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit"])
+    pipe.offload=offload
     return pipe
 
 
 
-def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,tiled=True,color_fix=True,fix_method="wavelet",split_num=81,dtype=torch.bfloat16,device="cuda",save_vodeo_=False,):
-    pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
+def run_inference(pipe,input,seed,scale,kv_ratio=3.0,local_range=9,step=1,cfg_scale=1.0,sparse_ratio=2.0,offload=False,dtype=torch.bfloat16,device="cuda",):
+    if not offload:
+        pipe.to('cuda')  #pipe.enable_vram_management(num_persistent_param_in_dit=None)
     #pipe.init_cross_kv(prompt_path); pipe.load_models_to_device(["dit","vae"])
-    pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
+    #pad_first_frame = True  if "wavelet"== fix_method and color_fix else False
 
     #total,h0,w0,_ = input.shape
     torch.cuda.empty_cache(); torch.cuda.ipc_collect()
 
     LQ, th, tw, F, fps,pad_frames = prepare_input_tensor(input, scale=scale, dtype=dtype, device=device)
 
-    frames = pipe(
-        prompt="", negative_prompt="", cfg_scale=cfg_scale, num_inference_steps=step, seed=seed, tiled=tiled,
+    frames,LQ_cur_idx = pipe(
+        prompt="", negative_prompt="", cfg_scale=cfg_scale, num_inference_steps=step, seed=seed, tiled=True,
         LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
         topk_ratio=sparse_ratio*768*1280/(th*tw), 
         kv_ratio=kv_ratio,
         local_range=local_range, # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
-        color_fix = color_fix,
+        color_fix = True,
+        offload=offload,
     )
-    pipe.dit.to('cpu')
+    
+    if not offload:
+        pipe.dit.to('cpu')
     torch.cuda.empty_cache()
     #torch.Size([1, 16, 20, 48, 80])
-    tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}
-    with torch.no_grad():
-        try:
-            frames = pipe.decode_video(frames, **tiler_kwargs)
-        except:
-            print("vae decode_video OOM.try split latent" )
-            if pipe.new_decoder:
-                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
-                    pipe.VAE.to('cpu')
-                else:
-                    if pipe.VAE.__class__.__name__ == "WanVAE":
-                        pipe.VAE.to_cpu()
-                    else: pass
-            else:
-                pipe.vae.to('cpu')
-            torch.cuda.empty_cache()  
-            if pipe.new_decoder:
-                if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
-                    pipe.VAE.to('cuda') 
-                else:
-                    if pipe.VAE.__class__.__name__ == "WanVAE":
-                        pipe.VAE.to_cuda()
-                    else: pass
-            else:
-                pipe.vae.to('cuda')
-            total_frames = frames.shape[2]
-            segment_size = (split_num-1) * 2 // 4 # 40
-            decoded_frames_list = []
-            for start_idx in range(0, total_frames, segment_size):
-                end_idx = min(start_idx + segment_size, total_frames)
-                frames_segment = frames[:, :, start_idx:end_idx, :, :]          
-                decoded_segment = pipe.decode_video(frames_segment, **tiler_kwargs)
-                decoded_frames_list.append(decoded_segment)
-            frames = torch.cat(decoded_frames_list, dim=2)  
-        try:
-            if color_fix:
-                if pad_first_frame:
-                    frames = dup_first_frame_1cthw_simple(frames)
-                    LQ=dup_first_frame_1cthw_simple(LQ)
-                if pipe.new_decoder and LQ.shape[-1]!=frames.shape[-1]:
-                    scale_=int(frames.shape[-1]/LQ.shape[-1])
-                    LQ=upscale_lq_video_bilinear(LQ,scale_)
-                frames = pipe.ColorCorrector(
-                    frames.to(device=device),
-                    LQ[:, :, :frames.shape[2], :, :],
-                    clip_range=(-1, 1),
-                    chunk_size=16,
-                    method=fix_method
-                )
-                if pad_first_frame:
-                    frames = frames[:, :, 1:, :, :] # remove first  frame torch.Size([1, 3, 78, 1024, 768]) --> torch.Size([1, 3, 77, 1024, 768])
-        except:
-            pass
-        print("Done.")
-        pipe.vae.to('cpu')  
-    del LQ
-    torch.cuda.empty_cache() 
+    # tiler_kwargs = {"tiled": tiled, "tile_size": (60, 104), "tile_stride": (30, 52)}
+    # with torch.no_grad():
+    #     try:
+    #         frames = pipe.decode_video(frames, **tiler_kwargs)
+    #     except:
+    #         print("vae decode_video OOM.try split latent" )
+    #         if pipe.new_decoder:
+    #             if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
+    #                 pipe.VAE.to('cpu')
+    #             else:
+    #                 if pipe.VAE.__class__.__name__ == "WanVAE":
+    #                     pipe.VAE.to_cpu()
+    #                 else: pass
+    #         else:
+    #             pipe.vae.to('cpu')
+    #         torch.cuda.empty_cache()  
+    #         if pipe.new_decoder:
+    #             if pipe.VAE.__class__.__name__ == "AutoencoderKLWan":
+    #                 pipe.VAE.to('cuda') 
+    #             else:
+    #                 if pipe.VAE.__class__.__name__ == "WanVAE":
+    #                     pipe.VAE.to_cuda()
+    #                 else: pass
+    #         else:
+    #             pipe.vae.to('cuda')
+    #         total_frames = frames.shape[2]
+    #         segment_size = (split_num-1) * 2 // 4 # 40
+    #         decoded_frames_list = []
+    #         for start_idx in range(0, total_frames, segment_size):
+    #             end_idx = min(start_idx + segment_size, total_frames)
+    #             frames_segment = frames[:, :, start_idx:end_idx, :, :]          
+    #             decoded_segment = pipe.decode_video(frames_segment, **tiler_kwargs)
+    #             decoded_frames_list.append(decoded_segment)
+    #         frames = torch.cat(decoded_frames_list, dim=2)  
+    #     try:
+    #         if color_fix:
+    #             if pad_first_frame:
+    #                 frames = dup_first_frame_1cthw_simple(frames)
+    #                 LQ=dup_first_frame_1cthw_simple(LQ)
+    #             if pipe.new_decoder and LQ.shape[-1]!=frames.shape[-1]:
+    #                 scale_=int(frames.shape[-1]/LQ.shape[-1])
+    #                 LQ=upscale_lq_video_bilinear(LQ,scale_)
+    #             frames = pipe.ColorCorrector(
+    #                 frames.to(device=device),
+    #                 LQ[:, :, :frames.shape[2], :, :],
+    #                 clip_range=(-1, 1),
+    #                 chunk_size=16,
+    #                 method=fix_method
+    #             )
+    #             if pad_first_frame:
+    #                 frames = frames[:, :, 1:, :, :] # remove first  frame torch.Size([1, 3, 78, 1024, 768]) --> torch.Size([1, 3, 77, 1024, 768])
+    #     except:
+    #         pass
+    #     print("Done.")
+    #     pipe.vae.to('cpu')  
+    # del LQ
+    # torch.cuda.empty_cache() 
 
-    if pad_frames>0:
-        print("Remove pad frames",pad_frames,frames.shape)
-        frames =  frames = frames[:, :, :-pad_frames, :, :]  #torch.Size([1, 3, 85, 1024, 768]) -> torch.Size([1, 3, 81, 1024, 768]) if 81 output -4 input + 8
+    # if pad_frames>0:
+    #     print("Remove pad frames",pad_frames,frames.shape)
+    #     frames =  frames = frames[:, :, :-pad_frames, :, :]  #torch.Size([1, 3, 85, 1024, 768]) -> torch.Size([1, 3, 81, 1024, 768]) if 81 output -4 input + 8
         
-    frames = tensor2video(frames[0])    
-    if save_vodeo_:
-        save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)
-    return frames
+    # frames = tensor2video(frames[0])    
+    # if save_vodeo_:
+    #     save_video(frames, os.path.join(folder_paths.get_output_directory(),f"FlashVSR_Full_seed{seed}.mp4"), fps=fps, quality=6)
+    return frames,LQ_cur_idx,LQ,pad_frames
 
 def upscale_lq_video_bilinear(LQ_video,scale_):
     B, C, T, H, W = LQ_video.shape
