@@ -12,6 +12,7 @@ opencv-python
 opencv-python-headless
 peft
 pillow
+diffusers
 safetensors
 sentencepiece
 transformers
